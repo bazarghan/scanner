@@ -170,6 +170,43 @@ def sequential_ip_indices(total_ips):
     for i in range(total_ips):
         yield i
 
+def ask_with_folder_choices(prompt_title, folder_paths, default=""):
+    if isinstance(folder_paths, str):
+        folder_paths = [folder_paths]
+        
+    file_entries = []
+    for folder in folder_paths:
+        if os.path.exists(folder):
+            for f in os.listdir(folder):
+                if f.endswith(".txt"):
+                    file_entries.append((f[:-4], folder))
+                    
+    file_entries.sort(key=lambda x: (x[0].lower(), x[1]))
+    
+    if file_entries:
+        console.print(f"\n[cyan]Available options:[/cyan]")
+        for idx, (name, folder) in enumerate(file_entries, 1):
+            console.print(f"  [yellow]{idx}[/yellow]. {name} [dim]({folder})[/dim]")
+        console.print("[dim]Type number(s) separated by commas, or enter a custom value.[/dim]")
+        
+    choice = Prompt.ask(f"[bold green]{prompt_title}[/bold green]", default=default)
+    if not choice.strip():
+        return choice
+        
+    selected_items = []
+    for part in choice.split(','):
+        part = part.strip()
+        if part.isdigit() and file_entries:
+            idx = int(part)
+            if 1 <= idx <= len(file_entries):
+                selected_items.append(file_entries[idx-1][0])
+            else:
+                selected_items.append(part)
+        else:
+            selected_items.append(part)
+            
+    return ", ".join(selected_items)
+
 def parse_ip_input(input_str):
     if not input_str.strip():
         input_str = 'cloudflare'
@@ -370,7 +407,7 @@ def scanner_tool():
     console.print()
     console.print("[cyan]➜[/cyan] [bold]Enter IP targets[/bold] (comma separated IPs, CIDRs, ranges, or .txt files).")
     console.print("  [dim]Leave empty or type 'cloudflare' for Cloudflare IP ranges.[/dim]")
-    ip_input = Prompt.ask("[bold green]IP Ranges[/bold green]", default="cloudflare")
+    ip_input = ask_with_folder_choices("IP Ranges", ["ip_ranges", "custom_ranges"], default="cloudflare")
     networks = parse_ip_input(ip_input)
     
     ip_targets = IPTargets(networks)
@@ -383,7 +420,7 @@ def scanner_tool():
     # 2. Ask for Target Ports
     console.print("[cyan]➜[/cyan] [bold]Enter target ports[/bold] (comma separated or ranges like 80-90).")
     console.print("  [dim]Leave empty or type 'cloudflare' for Cloudflare standard ports.[/dim]")
-    port_input = Prompt.ask("[bold green]Ports[/bold green]", default="cloudflare")
+    port_input = ask_with_folder_choices("Ports", "port_ranges", default="cloudflare")
     ports = parse_ports(port_input)
     
     if not ports:
@@ -775,7 +812,7 @@ def dns_scanner_tool():
     
     console.print("[cyan]➜[/cyan] [bold]Enter IP targets[/bold] (comma separated IPs, CIDRs, ranges, or .txt files).")
     console.print("  [dim]Leave empty or type 'cloudflare' for Cloudflare IP ranges.[/dim]")
-    ip_input = Prompt.ask("[bold green]IP Ranges[/bold green]", default="cloudflare")
+    ip_input = ask_with_folder_choices("IP Ranges", ["ip_ranges", "custom_ranges"], default="cloudflare")
     networks = parse_ip_input(ip_input)
     
     ip_targets = IPTargets(networks)
@@ -1036,7 +1073,7 @@ def sni_scanner_tool():
     
     console.print("[cyan]➜[/cyan] [bold]Enter SNI(s) to check[/bold] (comma separated domains or .txt files)")
     console.print("  [dim]Alternatively type a filename from the 'sni' folder.[/dim]")
-    sni_input = Prompt.ask("[bold green]SNIs/Files[/bold green]")
+    sni_input = ask_with_folder_choices("SNIs/Files", "sni")
     if not sni_input.strip():
         console.print("[bold red]SNI input is required.[/bold red]")
         return
