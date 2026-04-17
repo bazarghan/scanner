@@ -28,7 +28,4 @@ dns_tunnel_results_*.json
 *_ips.txt
 
 # Ignore custom fetched ranges but keep default cloudflare configurations
-ip_ranges/*
-!ip_ranges/cloudflare.txt
-port_ranges/*
-!port_ranges/cloudflare.txt
+custom_ranges/*

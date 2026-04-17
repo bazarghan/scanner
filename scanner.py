@@ -196,6 +196,16 @@ def parse_ip_input(input_str):
                             networks.append(line)
             except Exception as e:
                 console.print(f"[bold red]Failed to read file {filepath}: {e}[/bold red]")
+        elif os.path.isfile(os.path.join("custom_ranges", f"{item}.txt")):
+            filepath = os.path.join("custom_ranges", f"{item}.txt")
+            try:
+                with open(filepath, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            networks.append(line)
+            except Exception as e:
+                console.print(f"[bold red]Failed to read file {filepath}: {e}[/bold red]")
         else:
             networks.append(item)
             
@@ -242,6 +252,33 @@ def parse_ports(input_str):
             except:
                 console.print(f"[bold red]Invalid port skipped: {p}[/bold red]")
     return sorted(list(set(ports)))
+
+def parse_sni_input(input_str):
+    snis = []
+    items = [i.strip() for i in input_str.split(',') if i.strip()]
+    for item in items:
+        if os.path.isfile(item):
+            try:
+                with open(item, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            snis.append(line)
+            except Exception as e:
+                console.print(f"[bold red]Failed to read file {item}: {e}[/bold red]")
+        elif os.path.isfile(os.path.join("sni", f"{item}.txt")):
+            filepath = os.path.join("sni", f"{item}.txt")
+            try:
+                with open(filepath, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            snis.append(line)
+            except Exception as e:
+                console.print(f"[bold red]Failed to read file {filepath}: {e}[/bold red]")
+        else:
+            snis.append(item)
+    return list(dict.fromkeys(snis))
 
 def load_ip_ranges_map():
     range_map = {}
@@ -544,8 +581,8 @@ def fetch_ips_tool():
             default_filename = f"{cc}_ips.txt"
             filename = Prompt.ask("Save to file", default=default_filename)
             
-            os.makedirs("ip_ranges", exist_ok=True)
-            filepath = os.path.join("ip_ranges", os.path.basename(filename))
+            os.makedirs("custom_ranges", exist_ok=True)
+            filepath = os.path.join("custom_ranges", os.path.basename(filename))
             with open(filepath, "w") as f:
                 for prefix in ipv4_list:
                     f.write(f"{prefix}\n")
@@ -566,8 +603,8 @@ def fetch_ips_tool():
         default_filename = f"{asns[0]}_ips.txt" if len(asns) == 1 else "asns_ips.txt"
         filename = Prompt.ask("Save to file", default=default_filename)
         
-        os.makedirs("ip_ranges", exist_ok=True)
-        filepath = os.path.join("ip_ranges", os.path.basename(filename))
+        os.makedirs("custom_ranges", exist_ok=True)
+        filepath = os.path.join("custom_ranges", os.path.basename(filename))
         
         all_ips = []
         for asn in asns:
@@ -905,25 +942,32 @@ def dns_scanner_tool():
                 json.dump([{"ip": ip, "score": score, "details": res} for ip, score, res in final_results], f, indent=4)
             console.print(f"[green]✔[/green] Results saved to [bold white]{filepath}[/bold white]")
 
-def sni_worker(task_queue, sni, timeout, results_list, lock, pbar, cancel_event):
+def sni_worker(task_queue, timeout, results_list, lock, pbar, cancel_event):
     while not cancel_event.is_set():
         try:
-            ip_str = task_queue.get(timeout=0.5)
+            sni = task_queue.get(timeout=0.5)
         except queue.Empty:
             continue
             
-        if ip_str is None:
+        if sni is None:
             task_queue.task_done()
             break
             
         # 1. DNS Resolve
         dns_ok, dns_d = False, -1
+        ip_str = ""
         try:
             start_t = time.time()
-            socket.gethostbyname(sni)
+            ip_str = socket.gethostbyname(sni)
             dns_ok = True
             dns_d = int((time.time() - start_t) * 1000)
         except: pass
+        
+        if not dns_ok or not ip_str:
+            if not cancel_event.is_set():
+                pbar.update(1)
+            task_queue.task_done()
+            continue
         
         # 2. ICMP
         icmp_ok, icmp_d = False, -1
@@ -974,12 +1018,13 @@ def sni_worker(task_queue, sni, timeout, results_list, lock, pbar, cancel_event)
             with lock:
                 results_list.append({
                     "ip": ip_str,
+                    "sni": sni,
                     "dns": (dns_ok, dns_d),
                     "icmp": (icmp_ok, icmp_d),
                     "tcp": (tcp_ok, tcp_d),
                     "tls": (tls_ok, tls_d)
                 })
-                recent = ", ".join([f"{r['ip']}" for r in results_list[-5:]])
+                recent = ", ".join([f"{r['sni']}" for r in results_list[-5:]])
                 pbar.set_postfix_str(recent, refresh=False)
 
         if not cancel_event.is_set():
@@ -989,78 +1034,48 @@ def sni_worker(task_queue, sni, timeout, results_list, lock, pbar, cancel_event)
 def sni_scanner_tool():
     console.print("\n[bold cyan]--- SNI Scanner ---[/bold cyan]")
     
-    console.print("[cyan]➜[/cyan] [bold]Enter SNI/Hostname to check[/bold] (e.g. speedtest.net)")
-    sni = Prompt.ask("[bold green]SNI Hostname[/bold green]")
-    if not sni.strip():
-        console.print("[bold red]SNI Hostname is required.[/bold red]")
+    console.print("[cyan]➜[/cyan] [bold]Enter SNI(s) to check[/bold] (comma separated domains or .txt files)")
+    console.print("  [dim]Alternatively type a filename from the 'sni' folder.[/dim]")
+    sni_input = Prompt.ask("[bold green]SNIs/Files[/bold green]")
+    if not sni_input.strip():
+        console.print("[bold red]SNI input is required.[/bold red]")
         return
         
-    try:
-        console.print(f"[dim]Checking basic DNS resolution for {sni}...[/dim]")
-        sni_ip = socket.gethostbyname(sni.strip())
-        console.print(f"[green]✔[/green] Hostname is valid (Resolves to {sni_ip}).\n")
-    except socket.error:
-        console.print(f"[bold yellow]⚠ SNI '{sni}' does not resolve globally. It might be blocked or invalid.[/bold yellow]")
-        if not Confirm.ask("Do you want to proceed anyway?"):
-            return
-    sni = sni.strip()
-
-    console.print("[cyan]➜[/cyan] [bold]Enter IP targets[/bold] (comma separated IPs, CIDRs, ranges, or .txt files).")
-    console.print("  [dim]Leave empty or type 'cloudflare' for Cloudflare IP ranges.[/dim]")
-    ip_input = Prompt.ask("[bold green]IP Ranges[/bold green]", default="cloudflare")
-    networks = parse_ip_input(ip_input)
+    snis = parse_sni_input(sni_input)
+    if not snis:
+        return
+        
+    valid_snis = [sni.strip() for sni in snis if sni.strip()]
     
-    ip_targets = IPTargets(networks)
-    if ip_targets.total == 0:
+    if not valid_snis:
+        console.print("[bold red]No valid SNIs provided. Aborting.[/bold red]")
         return
-        
+
     range_map = load_ip_ranges_map()
         
     console.print("\n[cyan]➜[/cyan] [bold]Scan Configuration[/bold]")
     num_threads = IntPrompt.ask("Number of threads", default=500)
     timeout = float(Prompt.ask("Timeout (seconds)", default="1.5"))
-    is_random = Confirm.ask("Randomize IP search order?", default=True)
-    
-    max_ips = 0
-    if is_random and ip_targets.total > 10:
-        limit_clean = Prompt.ask("Max IPs to scan (leave empty for no limit)", default="")
-        if limit_clean.strip().isdigit():
-            max_ips = int(limit_clean.strip())
 
-    total_targets = max_ips if (0 < max_ips < ip_targets.total) else ip_targets.total
-
+    total_targets = len(valid_snis)
     task_queue = queue.Queue(maxsize=1_000_000)
     results_list = []
     lock = threading.Lock()
     threads = []
     cancel_event = threading.Event()
     
+    for sni in valid_snis:
+        task_queue.put(sni)
+        
     start_time = datetime.now()
-    
     console.print()
+    
     try:
-        with rtqdm(total=total_targets, desc="[magenta]Scanning SNI[/magenta]", unit="ip") as pbar:
+        with rtqdm(total=total_targets, desc="[magenta]Scanning SNI[/magenta]", unit="domain") as pbar:
             for _ in range(num_threads):
-                t = threading.Thread(target=sni_worker, args=(task_queue, sni, timeout, results_list, lock, pbar, cancel_event), daemon=True)
+                t = threading.Thread(target=sni_worker, args=(task_queue, timeout, results_list, lock, pbar, cancel_event), daemon=True)
                 t.start()
                 threads.append(t)
-                
-            ip_gen = random_ip_indices_lcg(ip_targets.total) if is_random else sequential_ip_indices(ip_targets.total)
-
-            scanned_ips = 0
-            for ip_index in ip_gen:
-                if cancel_event.is_set() or (0 < max_ips <= scanned_ips): break
-                
-                ip_int = ip_targets.get_ip(ip_index)
-                ip_str = str(ipaddress.IPv4Address(ip_int))
-                
-                while not cancel_event.is_set():
-                    try:
-                        task_queue.put(ip_str, timeout=0.1)
-                        break
-                    except queue.Full: continue
-                        
-                scanned_ips += 1
                 
             while not cancel_event.is_set() and not task_queue.empty():
                 time.sleep(0.1)
@@ -1090,8 +1105,9 @@ def sni_scanner_tool():
     if not final_results:
         console.print(Panel("[bold yellow]No valid IPs found.[/bold yellow]", border_style="yellow"))
     else:
-        res_table = Table(title=f"SNI Scanner Results ({sni})", border_style="green")
-        res_table.add_column("IP Address", style="cyan")
+        res_table = Table(title="SNI Scanner Results", border_style="green")
+        res_table.add_column("SNI Domain", style="magenta", justify="left")
+        res_table.add_column("Resolved IP", style="cyan", justify="left")
         res_table.add_column("Range", style="blue")
         res_table.add_column("DNS", justify="center")
         res_table.add_column("ICMP", justify="center")
@@ -1110,8 +1126,9 @@ def sni_scanner_tool():
         limit = 100
         for res in final_results[:limit]:
             ip = res["ip"]
+            sni = res["sni"]
             rng = get_ip_range_name(ip, range_map)
-            res_table.add_row(ip, rng, fmt(res["dns"]), fmt(res["icmp"]), fmt(res["tcp"]), fmt(res["tls"]))
+            res_table.add_row(sni, ip, rng, fmt(res["dns"]), fmt(res["icmp"]), fmt(res["tcp"]), fmt(res["tls"]))
             
         console.print(res_table)
         if len(final_results) > limit:
