@@ -389,20 +389,29 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
             start_t = time.time()
             if sock.connect_ex((ip, port)) == 0:
                 if scan_mode == "handshake":
-                    # Perform full TLS handshake after TCP connect
+                    # Perform full TLS handshake + verify data can flow
                     try:
                         ctx = ssl.create_default_context()
                         ctx.check_hostname = False
                         ctx.verify_mode = ssl.CERT_NONE
                         tls_sock = ctx.wrap_socket(sock, server_hostname=ip)
-                        delay = int((time.time() - start_t) * 1000)
-                        with lock:
-                            results.append((ip, port, delay))
-                            recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
-                            pbar.set_postfix_str(recent, refresh=False)
+                        # TLS handshake done — now send a real HTTP request
+                        # to verify DPI doesn't RST the connection on actual data
+                        tls_sock.sendall(f"HEAD / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode())
+                        # Try to read at least 1 byte of response
+                        resp = tls_sock.recv(1)
+                        if resp:
+                            delay = int((time.time() - start_t) * 1000)
+                            with lock:
+                                results.append((ip, port, delay))
+                                recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
+                                pbar.set_postfix_str(recent, refresh=False)
                         tls_sock.close()
-                    except (ssl.SSLError, socket.timeout, OSError):
-                        sock.close()
+                    except (ssl.SSLError, socket.timeout, OSError, ConnectionResetError, BrokenPipeError):
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
                 else:
                     # TCP-only: connection success is enough
                     delay = int((time.time() - start_t) * 1000)
@@ -414,6 +423,40 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
             else:
                 sock.close()
         except Exception:
+            pass
+            
+        if not cancel_event.is_set():
+            pbar.update(1)
+        task_queue.task_done()
+
+def icmp_worker(task_queue, timeout, results, lock, pbar, cancel_event):
+    while not cancel_event.is_set():
+        try:
+            target = task_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+            
+        if target is None:
+            task_queue.task_done()
+            break
+            
+        ip = target
+        try:
+            timeout_int = max(1, int(timeout))
+            start_t = time.time()
+            # Use ping -c1 with timeout; works without root unlike raw ICMP sockets
+            if sys.platform == "darwin":
+                cmd = ["ping", "-c", "1", "-t", str(timeout_int), ip]
+            else:
+                cmd = ["ping", "-c", "1", "-W", str(timeout_int), ip]
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_int + 2)
+            if result.returncode == 0:
+                delay = int((time.time() - start_t) * 1000)
+                with lock:
+                    results.append((ip, 0, delay))
+                    recent = ", ".join([f"{r[0]}({r[2]}ms)" for r in results[-5:]])
+                    pbar.set_postfix_str(recent, refresh=False)
+        except (subprocess.TimeoutExpired, Exception):
             pass
             
         if not cancel_event.is_set():
@@ -436,30 +479,41 @@ def scanner_tool():
         
     console.print(f"[green]✔[/green] Loaded [bold white]{ip_targets.total:,}[/bold white] total IPs to scan.")
 
-    # 2. Ask for Target Ports
-    console.print("[cyan]➜[/cyan] [bold]Enter target ports[/bold] (comma separated or ranges like 80-90).")
-    console.print("  [dim]Leave empty or type 'cloudflare' for Cloudflare standard ports.[/dim]")
-    port_input = ask_with_folder_choices("Ports", "port_ranges", default="cloudflare")
-    ports = parse_ports(port_input)
-    
-    if not ports:
-        console.print("[bold red]No valid ports provided. Going back.[/bold red]")
-        return
-        
-    console.print(f"[green]✔[/green] Loaded [bold white]{len(ports)}[/bold white] ports to scan: {ports}")
-    
-    # 3. Ask for Scan Mode
+    # 2. Ask for Scan Mode (before ports, since ICMP doesn't need ports)
     console.print("[cyan]➜[/cyan] [bold]Scan Mode[/bold]")
     console.print("  [yellow]1[/yellow]. TCP Connect [dim](fast, checks if port is open)[/dim]")
-    console.print("  [yellow]2[/yellow]. TLS Handshake [dim](slower, verifies TLS/SSL is served)[/dim]")
-    scan_mode_choice = Prompt.ask("Select scan mode", choices=["1", "2"], default="1")
-    scan_mode = "tcp" if scan_mode_choice == "1" else "handshake"
-    console.print(f"[green]✔[/green] Scan mode: [bold white]{'TCP Connect' if scan_mode == 'tcp' else 'TLS Handshake'}[/bold white]")
+    console.print("  [yellow]2[/yellow]. TLS Handshake [dim](slower, verifies TLS/SSL + data flow)[/dim]")
+    console.print("  [yellow]3[/yellow]. ICMP Ping [dim](checks if host is alive, no port needed)[/dim]")
+    scan_mode_choice = Prompt.ask("Select scan mode", choices=["1", "2", "3"], default="1")
+    if scan_mode_choice == "1":
+        scan_mode = "tcp"
+    elif scan_mode_choice == "2":
+        scan_mode = "handshake"
+    else:
+        scan_mode = "icmp"
+    
+    mode_labels = {"tcp": "TCP Connect", "handshake": "TLS Handshake", "icmp": "ICMP Ping"}
+    console.print(f"[green]✔[/green] Scan mode: [bold white]{mode_labels[scan_mode]}[/bold white]")
+    
+    # 3. Ask for Target Ports (skip for ICMP)
+    ports = []
+    if scan_mode != "icmp":
+        console.print("[cyan]➜[/cyan] [bold]Enter target ports[/bold] (comma separated or ranges like 80-90).")
+        console.print("  [dim]Leave empty or type 'cloudflare' for Cloudflare standard ports.[/dim]")
+        port_input = ask_with_folder_choices("Ports", "port_ranges", default="cloudflare")
+        ports = parse_ports(port_input)
+        
+        if not ports:
+            console.print("[bold red]No valid ports provided. Going back.[/bold red]")
+            return
+            
+        console.print(f"[green]✔[/green] Loaded [bold white]{len(ports)}[/bold white] ports to scan: {ports}")
     
     # 4. Ask for Threads and Timeout
     console.print("[cyan]➜[/cyan] [bold]Scan Configuration[/bold]")
-    num_threads = IntPrompt.ask("Number of threads", default=500)
-    timeout = float(Prompt.ask("Timeout (seconds)", default="1.0"))
+    default_threads = 100 if scan_mode == "icmp" else 500
+    num_threads = IntPrompt.ask("Number of threads", default=default_threads)
+    timeout = float(Prompt.ask("Timeout (seconds)", default="2.0" if scan_mode == "icmp" else "1.0"))
     is_random = Confirm.ask("Randomize IP search order? (Helps find open IPs sooner)", default=True)
     
     max_ips = 0
@@ -475,8 +529,11 @@ def scanner_tool():
     search_ips_count = ip_targets.total
     if 0 < max_ips < ip_targets.total:
         search_ips_count = max_ips
-        
-    total_targets = search_ips_count * len(ports)
+    
+    if scan_mode == "icmp":
+        total_targets = search_ips_count  # 1 task per IP, no ports
+    else:
+        total_targets = search_ips_count * len(ports)
     
     table = Table(title="Scan Configuration", title_style="bold magenta", border_style="cyan")
     table.add_column("Property", style="cyan", no_wrap=True)
@@ -485,11 +542,12 @@ def scanner_tool():
     table.add_row("Total Available IPs", f"{ip_targets.total:,}")
     if 0 < max_ips < ip_targets.total:
         table.add_row("Scanning IPs Limit", f"{max_ips:,}")
-    table.add_row("Target Ports", f"{len(ports)}")
+    if scan_mode != "icmp":
+        table.add_row("Target Ports", f"{len(ports)}")
     table.add_row("Total Tasks", f"{total_targets:,}")
     table.add_row("Threads", str(num_threads))
     table.add_row("Timeout", f"{timeout}s")
-    table.add_row("Scan Mode", "TLS Handshake" if scan_mode == "handshake" else "TCP Connect")
+    table.add_row("Scan Mode", mode_labels[scan_mode])
     table.add_row("Search Order", "Randomized (LCG)" if is_random else "Sequential")
     
     console.print(table)
@@ -511,11 +569,19 @@ def scanner_tool():
     start_time = datetime.now()
     
     try:
-        with rtqdm(total=total_targets, desc="[magenta]Scanning[/magenta]", unit="port") as pbar:
-            for _ in range(num_threads):
-                t = threading.Thread(target=worker, args=(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode), daemon=True)
-                t.start()
-                threads.append(t)
+        unit_label = "ip" if scan_mode == "icmp" else "port"
+        with rtqdm(total=total_targets, desc="[magenta]Scanning[/magenta]", unit=unit_label) as pbar:
+            # Start worker threads
+            if scan_mode == "icmp":
+                for _ in range(num_threads):
+                    t = threading.Thread(target=icmp_worker, args=(task_queue, timeout, results, lock, pbar, cancel_event), daemon=True)
+                    t.start()
+                    threads.append(t)
+            else:
+                for _ in range(num_threads):
+                    t = threading.Thread(target=worker, args=(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode), daemon=True)
+                    t.start()
+                    threads.append(t)
                 
             if is_random:
                 ip_gen = random_ip_indices_lcg(ip_targets.total)
@@ -533,17 +599,25 @@ def scanner_tool():
                 ip_int = ip_targets.get_ip(ip_index)
                 ip_str = str(ipaddress.IPv4Address(ip_int))
                 
-                for port in ports:
-                    if cancel_event.is_set():
-                        break
-                    
+                if scan_mode == "icmp":
+                    # ICMP: one task per IP, no port iteration
                     while not cancel_event.is_set():
                         try:
-                            # small timeout allows regular checking of cancel_event
-                            task_queue.put((ip_str, port), timeout=0.1)
+                            task_queue.put(ip_str, timeout=0.1)
                             break
                         except queue.Full:
                             continue
+                else:
+                    for port in ports:
+                        if cancel_event.is_set():
+                            break
+                        
+                        while not cancel_event.is_set():
+                            try:
+                                task_queue.put((ip_str, port), timeout=0.1)
+                                break
+                            except queue.Full:
+                                continue
                             
                 scanned_ips += 1
                             
@@ -580,19 +654,32 @@ def scanner_tool():
         final_results = list(results)
     
     if not final_results:
-        console.print(Panel("[bold yellow]No open ports found.[/bold yellow]", border_style="yellow"))
+        no_results_msg = "[bold yellow]No reachable hosts found.[/bold yellow]" if scan_mode == "icmp" else "[bold yellow]No open ports found.[/bold yellow]"
+        console.print(Panel(no_results_msg, border_style="yellow"))
     else:
-        res_table = Table(title="Open Ports Found", border_style="green")
-        res_table.add_column("IP Address", style="cyan", justify="left")
-        res_table.add_column("Port", style="magenta", justify="center")
-        res_table.add_column("Delay", style="yellow", justify="center")
-        res_table.add_column("Status", style="green", justify="center")
-        
-        final_results.sort(key=lambda x: (ipaddress.IPv4Address(x[0]), x[1]))
-        
-        limit = 100
-        for ip, port, delay in final_results[:limit]:
-            res_table.add_row(str(ip), str(port), f"{delay}ms", "OPEN")
+        if scan_mode == "icmp":
+            res_table = Table(title="Reachable Hosts (ICMP)", border_style="green")
+            res_table.add_column("IP Address", style="cyan", justify="left")
+            res_table.add_column("Delay", style="yellow", justify="center")
+            res_table.add_column("Status", style="green", justify="center")
+            
+            final_results.sort(key=lambda x: ipaddress.IPv4Address(x[0]))
+            
+            limit = 100
+            for ip, _, delay in final_results[:limit]:
+                res_table.add_row(str(ip), f"{delay}ms", "ALIVE")
+        else:
+            res_table = Table(title="Open Ports Found", border_style="green")
+            res_table.add_column("IP Address", style="cyan", justify="left")
+            res_table.add_column("Port", style="magenta", justify="center")
+            res_table.add_column("Delay", style="yellow", justify="center")
+            res_table.add_column("Status", style="green", justify="center")
+            
+            final_results.sort(key=lambda x: (ipaddress.IPv4Address(x[0]), x[1]))
+            
+            limit = 100
+            for ip, port, delay in final_results[:limit]:
+                res_table.add_row(str(ip), str(port), f"{delay}ms", "OPEN")
         
         console.print(res_table)
         
@@ -603,14 +690,21 @@ def scanner_tool():
         if save:
             save_with_delay = Confirm.ask("Do you want to include delays in the output file?", default=False)
             os.makedirs("results", exist_ok=True)
-            filename = f"scan_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            prefix = "icmp_results" if scan_mode == "icmp" else "scan_results"
+            filename = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             filepath = os.path.join("results", os.path.basename(filename))
             with open(filepath, "w") as f:
                 for res in final_results:
-                    if save_with_delay:
-                        f.write(f"{res[0]}:{res[1]}, {res[2]}ms\n")
+                    if scan_mode == "icmp":
+                        if save_with_delay:
+                            f.write(f"{res[0]}, {res[2]}ms\n")
+                        else:
+                            f.write(f"{res[0]}\n")
                     else:
-                        f.write(f"{res[0]}:{res[1]}\n")
+                        if save_with_delay:
+                            f.write(f"{res[0]}:{res[1]}, {res[2]}ms\n")
+                        else:
+                            f.write(f"{res[0]}:{res[1]}\n")
             console.print(f"[green]✔[/green] Results saved to [bold white]{filepath}[/bold white]")
 
 def fetch_ips_tool():
