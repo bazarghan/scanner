@@ -389,7 +389,8 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
             start_t = time.time()
             if sock.connect_ex((ip, port)) == 0:
                 if scan_mode == "handshake":
-                    # Perform full TLS handshake + verify data can flow
+                    # Perform full TLS handshake + verify real HTTP response
+                    tls_sock = None
                     try:
                         ctx = ssl.create_default_context()
                         ctx.check_hostname = False
@@ -398,18 +399,22 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
                         # TLS handshake done — now send a real HTTP request
                         # to verify DPI doesn't RST the connection on actual data
                         tls_sock.sendall(f"HEAD / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode())
-                        # Try to read at least 1 byte of response
-                        resp = tls_sock.recv(1)
-                        if resp:
+                        # Read enough to verify a real HTTP response came back
+                        resp = tls_sock.recv(256)
+                        if resp and resp[:5] in (b"HTTP/", b"http/"):
                             delay = int((time.time() - start_t) * 1000)
                             with lock:
                                 results.append((ip, port, delay))
                                 recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
                                 pbar.set_postfix_str(recent, refresh=False)
-                        tls_sock.close()
+                        if tls_sock:
+                            tls_sock.close()
                     except (ssl.SSLError, socket.timeout, OSError, ConnectionResetError, BrokenPipeError):
                         try:
-                            sock.close()
+                            if tls_sock:
+                                tls_sock.close()
+                            else:
+                                sock.close()
                         except Exception:
                             pass
                 else:
