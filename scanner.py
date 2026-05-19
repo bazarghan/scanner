@@ -371,7 +371,7 @@ def get_ip_range_name(ip_str, range_map):
         pass
     return "Unknown"
 
-def worker(task_queue, timeout, results, lock, pbar, cancel_event):
+def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tcp"):
     while not cancel_event.is_set():
         try:
             target = task_queue.get(timeout=0.5)
@@ -388,12 +388,31 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event):
             sock.settimeout(timeout)
             start_t = time.time()
             if sock.connect_ex((ip, port)) == 0:
-                delay = int((time.time() - start_t) * 1000)
-                with lock:
-                    results.append((ip, port, delay))
-                    recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
-                    pbar.set_postfix_str(recent, refresh=False)
-            sock.close()
+                if scan_mode == "handshake":
+                    # Perform full TLS handshake after TCP connect
+                    try:
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        tls_sock = ctx.wrap_socket(sock, server_hostname=ip)
+                        delay = int((time.time() - start_t) * 1000)
+                        with lock:
+                            results.append((ip, port, delay))
+                            recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
+                            pbar.set_postfix_str(recent, refresh=False)
+                        tls_sock.close()
+                    except (ssl.SSLError, socket.timeout, OSError):
+                        sock.close()
+                else:
+                    # TCP-only: connection success is enough
+                    delay = int((time.time() - start_t) * 1000)
+                    with lock:
+                        results.append((ip, port, delay))
+                        recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
+                        pbar.set_postfix_str(recent, refresh=False)
+                    sock.close()
+            else:
+                sock.close()
         except Exception:
             pass
             
@@ -429,7 +448,15 @@ def scanner_tool():
         
     console.print(f"[green]✔[/green] Loaded [bold white]{len(ports)}[/bold white] ports to scan: {ports}")
     
-    # 3. Ask for Threads and Timeout
+    # 3. Ask for Scan Mode
+    console.print("[cyan]➜[/cyan] [bold]Scan Mode[/bold]")
+    console.print("  [yellow]1[/yellow]. TCP Connect [dim](fast, checks if port is open)[/dim]")
+    console.print("  [yellow]2[/yellow]. TLS Handshake [dim](slower, verifies TLS/SSL is served)[/dim]")
+    scan_mode_choice = Prompt.ask("Select scan mode", choices=["1", "2"], default="1")
+    scan_mode = "tcp" if scan_mode_choice == "1" else "handshake"
+    console.print(f"[green]✔[/green] Scan mode: [bold white]{'TCP Connect' if scan_mode == 'tcp' else 'TLS Handshake'}[/bold white]")
+    
+    # 4. Ask for Threads and Timeout
     console.print("[cyan]➜[/cyan] [bold]Scan Configuration[/bold]")
     num_threads = IntPrompt.ask("Number of threads", default=500)
     timeout = float(Prompt.ask("Timeout (seconds)", default="1.0"))
@@ -462,6 +489,7 @@ def scanner_tool():
     table.add_row("Total Tasks", f"{total_targets:,}")
     table.add_row("Threads", str(num_threads))
     table.add_row("Timeout", f"{timeout}s")
+    table.add_row("Scan Mode", "TLS Handshake" if scan_mode == "handshake" else "TCP Connect")
     table.add_row("Search Order", "Randomized (LCG)" if is_random else "Sequential")
     
     console.print(table)
@@ -485,7 +513,7 @@ def scanner_tool():
     try:
         with rtqdm(total=total_targets, desc="[magenta]Scanning[/magenta]", unit="port") as pbar:
             for _ in range(num_threads):
-                t = threading.Thread(target=worker, args=(task_queue, timeout, results, lock, pbar, cancel_event), daemon=True)
+                t = threading.Thread(target=worker, args=(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode), daemon=True)
                 t.start()
                 threads.append(t)
                 
