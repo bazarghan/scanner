@@ -14,6 +14,7 @@ from datetime import datetime
 import string
 import ssl
 import subprocess
+import shutil
 
 try:
     import dns.resolver
@@ -1471,6 +1472,141 @@ def sni_scanner_tool():
                 json.dump(final_results, f, indent=4)
             console.print(f"[green]✔[/green] Results saved to [bold white]{filepath}[/bold white]")
 
+def cleanup_ips_tool():
+    console.print("\n[bold cyan]--- Cleanup & Merge IP Ranges ---[/bold cyan]")
+    console.print("[dim]Removes duplicates, merges overlapping/adjacent CIDRs, and produces optimal ranges.[/dim]")
+    
+    console.print("\n[cyan]➜[/cyan] [bold]Select IP range file to clean[/bold]")
+    console.print("  [dim]Pick from ip_ranges/custom_ranges or enter a file path.[/dim]")
+    file_input = ask_with_folder_choices("File to clean", ["ip_ranges", "custom_ranges"])
+    
+    if not file_input.strip():
+        console.print("[bold red]No file specified. Going back.[/bold red]")
+        return
+    
+    # Resolve the file path
+    source_path = None
+    for folder in ["ip_ranges", "custom_ranges"]:
+        candidate = os.path.join(folder, f"{file_input}.txt")
+        if os.path.isfile(candidate):
+            source_path = candidate
+            break
+    if source_path is None and os.path.isfile(file_input):
+        source_path = file_input
+    if source_path is None and os.path.isfile(f"{file_input}.txt"):
+        source_path = f"{file_input}.txt"
+    
+    if not source_path or not os.path.isfile(source_path):
+        console.print(f"[bold red]File not found: {file_input}[/bold red]")
+        return
+    
+    # Read and parse
+    with open(source_path, 'r') as f:
+        lines = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+    
+    if not lines:
+        console.print("[bold red]File is empty or has no valid lines.[/bold red]")
+        return
+    
+    console.print(f"[green]✔[/green] Read [bold white]{len(lines)}[/bold white] lines from [bold]{source_path}[/bold]")
+    
+    # Parse into intervals
+    intervals = []
+    skipped = []
+    for line in lines:
+        try:
+            if '-' in line:
+                start_str, end_str = line.split('-', 1)
+                start = int(ipaddress.IPv4Address(start_str.strip()))
+                end = int(ipaddress.IPv4Address(end_str.strip()))
+                if start > end:
+                    start, end = end, start
+                intervals.append((start, end))
+            elif '/' in line:
+                net = ipaddress.IPv4Network(line, strict=False)
+                intervals.append((int(net.network_address), int(net.broadcast_address)))
+            else:
+                ip = int(ipaddress.IPv4Address(line))
+                intervals.append((ip, ip))
+        except Exception as e:
+            skipped.append((line, str(e)))
+    
+    if skipped:
+        console.print(f"[yellow]⚠ Skipped {len(skipped)} invalid lines[/yellow]")
+        for line, err in skipped[:5]:
+            console.print(f"  [dim]{line}: {err}[/dim]")
+    
+    if not intervals:
+        console.print("[bold red]No valid IP ranges found in file.[/bold red]")
+        return
+    
+    # Count original IPs (with overlaps)
+    original_total = sum(e - s + 1 for s, e in intervals)
+    
+    # Sort and merge
+    intervals.sort(key=lambda x: (x[0], -x[1]))
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    
+    # Convert to optimal CIDRs
+    cidrs = []
+    for start, end in merged:
+        cidrs.extend(ipaddress.summarize_address_range(
+            ipaddress.IPv4Address(start), ipaddress.IPv4Address(end)
+        ))
+    
+    unique_total = sum(c.num_addresses for c in cidrs)
+    overlap_removed = original_total - unique_total
+    
+    # Show summary
+    summary = Table(title="Cleanup Summary", border_style="cyan")
+    summary.add_column("Metric", style="cyan")
+    summary.add_column("Before", style="yellow", justify="right")
+    summary.add_column("After", style="green", justify="right")
+    summary.add_row("Lines / CIDRs", f"{len(lines):,}", f"{len(cidrs):,}")
+    summary.add_row("Total IPs", f"{original_total:,}", f"{unique_total:,}")
+    summary.add_row("Overlap removed", "", f"{overlap_removed:,}")
+    console.print(summary)
+    
+    if overlap_removed == 0 and len(cidrs) >= len(lines):
+        console.print("[green]✔[/green] File is already clean — no changes needed.")
+        return
+    
+    # Ask where to save
+    console.print("\n[cyan]➜[/cyan] [bold]Save cleaned ranges[/bold]")
+    console.print("  [yellow]1[/yellow]. Overwrite original file [dim](backup will be created)[/dim]")
+    console.print("  [yellow]2[/yellow]. Save to ip_ranges/ with a new name")
+    console.print("  [yellow]3[/yellow]. Cancel [dim](don't save)[/dim]")
+    save_choice = Prompt.ask("Save option", choices=["1", "2", "3"], default="1")
+    
+    if save_choice == "3":
+        console.print("[dim]Cancelled — no changes made.[/dim]")
+        return
+    
+    if save_choice == "1":
+        backup_path = source_path + ".bak"
+        shutil.copy2(source_path, backup_path)
+        console.print(f"[dim]Backup saved to {backup_path}[/dim]")
+        save_path = source_path
+    else:
+        base = os.path.splitext(os.path.basename(source_path))[0]
+        default_name = f"{base}_clean.txt"
+        new_name = Prompt.ask("Filename", default=default_name)
+        if not new_name.endswith(".txt"):
+            new_name += ".txt"
+        os.makedirs("ip_ranges", exist_ok=True)
+        save_path = os.path.join("ip_ranges", os.path.basename(new_name))
+    
+    with open(save_path, 'w') as f:
+        for cidr in cidrs:
+            f.write(f"{cidr}\n")
+    
+    console.print(f"[green]✔[/green] Cleaned ranges saved to [bold white]{save_path}[/bold white]")
+
 def main():
     display_banner()
     while True:
@@ -1479,9 +1615,10 @@ def main():
         console.print("2. Fetch IPs by ASN / Country Code")
         console.print("3. Evaluate IPs for DNS Tunneling")
         console.print("4. SNI Scanner")
-        console.print("5. Exit")
+        console.print("5. Cleanup & Merge IP Ranges")
+        console.print("6. Exit")
         
-        choice = Prompt.ask("Select an option", choices=["1", "2", "3", "4", "5"])
+        choice = Prompt.ask("Select an option", choices=["1", "2", "3", "4", "5", "6"])
         
         if choice == "1":
             scanner_tool()
@@ -1492,6 +1629,8 @@ def main():
         elif choice == "4":
             sni_scanner_tool()
         elif choice == "5":
+            cleanup_ips_tool()
+        elif choice == "6":
             console.print("[dim]Exiting... Goodbye![/dim]")
             sys.exit(0)
 
