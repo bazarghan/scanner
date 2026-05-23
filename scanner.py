@@ -431,8 +431,9 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
                     delay = int((time.time() - start_t) * 1000)
                     with lock:
                         results.append((ip, port, delay))
-                        recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
-                        pbar.set_postfix_str(recent, refresh=False)
+                        count = len(results)
+                        recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-3:]])
+                        pbar.set_postfix_str(f"✔ {count} | {recent}", refresh=False)
             else:
                 # TCP-only: connection success is enough
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -441,8 +442,9 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
                     delay = int((time.time() - start_t) * 1000)
                     with lock:
                         results.append((ip, port, delay))
-                        recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
-                        pbar.set_postfix_str(recent, refresh=False)
+                        count = len(results)
+                        recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-3:]])
+                        pbar.set_postfix_str(f"✔ {count} | {recent}", refresh=False)
                 sock.close()
         except Exception:
             pass
@@ -476,8 +478,9 @@ def icmp_worker(task_queue, timeout, results, lock, pbar, cancel_event):
                 delay = int((time.time() - start_t) * 1000)
                 with lock:
                     results.append((ip, 0, delay))
-                    recent = ", ".join([f"{r[0]}({r[2]}ms)" for r in results[-5:]])
-                    pbar.set_postfix_str(recent, refresh=False)
+                    count = len(results)
+                    recent = ", ".join([f"{r[0]}({r[2]}ms)" for r in results[-3:]])
+                    pbar.set_postfix_str(f"✔ {count} | {recent}", refresh=False)
         except (subprocess.TimeoutExpired, Exception):
             pass
             
@@ -1082,6 +1085,8 @@ def dns_worker(task_queue, domain, timeout, results_list, lock, pbar, cancel_eve
         if score > 0:
             with lock:
                 results_list.append((ip_str, score, run_results))
+                count = len(results_list)
+                pbar.set_postfix_str(f"✔ {count} | {ip_str} (score:{score})", refresh=False)
             
         if not cancel_event.is_set():
             pbar.update(1)
@@ -1345,8 +1350,10 @@ def sni_worker(task_queue, timeout, results_list, lock, pbar, cancel_event):
                     "tcp": (tcp_ok, tcp_d),
                     "tls": (tls_ok, tls_d)
                 })
-                recent = ", ".join([f"{r['sni']}" for r in results_list[-5:]])
-                pbar.set_postfix_str(recent, refresh=False)
+                total_count = len(results_list)
+                tls_count = sum(1 for r in results_list if r['tls'][0])
+                recent = ", ".join([f"{r['sni']}" for r in results_list[-3:]])
+                pbar.set_postfix_str(f"✔ {total_count} (tls:{tls_count}) | {recent}", refresh=False)
 
         if not cancel_event.is_set():
             pbar.update(1)
