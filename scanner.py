@@ -384,48 +384,65 @@ def worker(task_queue, timeout, results, lock, pbar, cancel_event, scan_mode="tc
             
         ip, port = target
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
             start_t = time.time()
-            if sock.connect_ex((ip, port)) == 0:
-                if scan_mode == "handshake":
-                    # Perform full TLS handshake + verify real HTTP response
-                    tls_sock = None
+            if scan_mode == "handshake":
+                # Mimic curl -kI ip:port — single connection, any response = success
+                got_response = False
+                
+                # --- Attempt 1: HTTPS (TLS + HTTP HEAD) on same socket ---
+                sock = None
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    sock.connect((ip, port))
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    tls_sock = ctx.wrap_socket(sock, server_hostname=ip)
+                    sock = None  # tls_sock now owns the underlying socket
+                    tls_sock.sendall(f"HEAD / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode())
+                    resp = tls_sock.recv(512)
+                    if resp and len(resp) > 0:
+                        got_response = True
+                    tls_sock.close()
+                except Exception:
                     try:
-                        ctx = ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                        tls_sock = ctx.wrap_socket(sock, server_hostname=ip)
-                        # TLS handshake done — now send a real HTTP request
-                        # to verify DPI doesn't RST the connection on actual data
-                        tls_sock.sendall(f"HEAD / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode())
-                        # Read enough to verify a real HTTP response came back
-                        resp = tls_sock.recv(256)
-                        if resp and resp[:5] in (b"HTTP/", b"http/"):
-                            delay = int((time.time() - start_t) * 1000)
-                            with lock:
-                                results.append((ip, port, delay))
-                                recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
-                                pbar.set_postfix_str(recent, refresh=False)
-                        if tls_sock:
-                            tls_sock.close()
-                    except (ssl.SSLError, socket.timeout, OSError, ConnectionResetError, BrokenPipeError):
+                        if sock: sock.close()
+                    except: pass
+                
+                # --- Attempt 2: Plain HTTP HEAD (only if TLS failed) ---
+                if not got_response:
+                    sock = None
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(timeout)
+                        sock.connect((ip, port))
+                        sock.sendall(f"HEAD / HTTP/1.1\r\nHost: {ip}\r\nConnection: close\r\n\r\n".encode())
+                        resp = sock.recv(512)
+                        if resp and len(resp) > 0:
+                            got_response = True
+                        sock.close()
+                    except Exception:
                         try:
-                            if tls_sock:
-                                tls_sock.close()
-                            else:
-                                sock.close()
-                        except Exception:
-                            pass
-                else:
-                    # TCP-only: connection success is enough
+                            if sock: sock.close()
+                        except: pass
+                
+                if got_response:
                     delay = int((time.time() - start_t) * 1000)
                     with lock:
                         results.append((ip, port, delay))
                         recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
                         pbar.set_postfix_str(recent, refresh=False)
-                    sock.close()
             else:
+                # TCP-only: connection success is enough
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                if sock.connect_ex((ip, port)) == 0:
+                    delay = int((time.time() - start_t) * 1000)
+                    with lock:
+                        results.append((ip, port, delay))
+                        recent = ", ".join([f"{r[0]}:{r[1]}({r[2]}ms)" for r in results[-5:]])
+                        pbar.set_postfix_str(recent, refresh=False)
                 sock.close()
         except Exception:
             pass
@@ -711,6 +728,146 @@ def scanner_tool():
                         else:
                             f.write(f"{res[0]}:{res[1]}\n")
             console.print(f"[green]✔[/green] Results saved to [bold white]{filepath}[/bold white]")
+        
+        # --- Follow-up Recheck: only after TCP scan with results ---
+        if scan_mode == "tcp" and final_results:
+            console.print()
+            console.print("[cyan]➜[/cyan] [bold]Recheck Results[/bold]")
+            console.print("  [yellow]1[/yellow]. TLS Handshake [dim](verify TLS/HTTP on found IP:port pairs)[/dim]")
+            console.print("  [yellow]2[/yellow]. ICMP Ping [dim](check if found IPs are alive)[/dim]")
+            console.print("  [yellow]3[/yellow]. Skip [dim](done)[/dim]")
+            recheck_choice = Prompt.ask("Recheck found results?", choices=["1", "2", "3"], default="3")
+            
+            if recheck_choice in ("1", "2"):
+                recheck_mode = "handshake" if recheck_choice == "1" else "icmp"
+                recheck_label = "TLS Handshake" if recheck_mode == "handshake" else "ICMP Ping"
+                
+                console.print(f"\n[cyan]➜[/cyan] [bold]Recheck Configuration ({recheck_label})[/bold]")
+                rc_threads = IntPrompt.ask("Number of threads", default=100 if recheck_mode == "icmp" else 500)
+                rc_timeout = float(Prompt.ask("Timeout (seconds)", default="2.0" if recheck_mode == "icmp" else "1.0"))
+                
+                # Build unique targets from TCP results
+                if recheck_mode == "handshake":
+                    recheck_targets = [(ip, port) for ip, port, _ in final_results]
+                else:
+                    # ICMP: unique IPs only
+                    seen_ips = set()
+                    recheck_targets = []
+                    for ip, port, _ in final_results:
+                        if ip not in seen_ips:
+                            seen_ips.add(ip)
+                            recheck_targets.append(ip)
+                
+                total_recheck = len(recheck_targets)
+                console.print(f"[green]✔[/green] Rechecking [bold white]{total_recheck:,}[/bold white] {'IP:port pairs' if recheck_mode == 'handshake' else 'unique IPs'} with {recheck_label}")
+                console.print()
+                
+                rc_queue = queue.Queue(maxsize=1_000_000)
+                rc_results = []
+                rc_lock = threading.Lock()
+                rc_threads_list = []
+                rc_cancel = threading.Event()
+                
+                try:
+                    unit_label = "ip" if recheck_mode == "icmp" else "target"
+                    with rtqdm(total=total_recheck, desc=f"[magenta]Rechecking ({recheck_label})[/magenta]", unit=unit_label) as rc_pbar:
+                        if recheck_mode == "icmp":
+                            for _ in range(rc_threads):
+                                t = threading.Thread(target=icmp_worker, args=(rc_queue, rc_timeout, rc_results, rc_lock, rc_pbar, rc_cancel), daemon=True)
+                                t.start()
+                                rc_threads_list.append(t)
+                            for ip_str in recheck_targets:
+                                while not rc_cancel.is_set():
+                                    try:
+                                        rc_queue.put(ip_str, timeout=0.1)
+                                        break
+                                    except queue.Full:
+                                        continue
+                        else:
+                            for _ in range(rc_threads):
+                                t = threading.Thread(target=worker, args=(rc_queue, rc_timeout, rc_results, rc_lock, rc_pbar, rc_cancel, "handshake"), daemon=True)
+                                t.start()
+                                rc_threads_list.append(t)
+                            for target in recheck_targets:
+                                while not rc_cancel.is_set():
+                                    try:
+                                        rc_queue.put(target, timeout=0.1)
+                                        break
+                                    except queue.Full:
+                                        continue
+                        
+                        while not rc_cancel.is_set() and not rc_queue.empty():
+                            time.sleep(0.1)
+                        
+                        if not rc_cancel.is_set():
+                            for _ in range(rc_threads):
+                                while not rc_cancel.is_set():
+                                    try:
+                                        rc_queue.put(None, timeout=0.1)
+                                        break
+                                    except queue.Full:
+                                        continue
+                            for t in rc_threads_list:
+                                while t.is_alive() and not rc_cancel.is_set():
+                                    t.join(timeout=0.1)
+                
+                except KeyboardInterrupt:
+                    rc_cancel.set()
+                    console.print("\n[bold yellow]Recheck interrupted! Showing partial results...[/bold yellow]")
+                
+                with rc_lock:
+                    rc_final = list(rc_results)
+                
+                console.print(f"\n[bold green]Recheck {'Interrupted' if rc_cancel.is_set() else 'Completed'}![/bold green]")
+                console.print(f"Passed: [bold white]{len(rc_final)}[/bold white] / {total_recheck}\n")
+                
+                if not rc_final:
+                    console.print(Panel("[bold yellow]No results passed the recheck.[/bold yellow]", border_style="yellow"))
+                else:
+                    if recheck_mode == "icmp":
+                        rc_table = Table(title=f"Recheck Results ({recheck_label})", border_style="green")
+                        rc_table.add_column("IP Address", style="cyan", justify="left")
+                        rc_table.add_column("Delay", style="yellow", justify="center")
+                        rc_table.add_column("Status", style="green", justify="center")
+                        rc_final.sort(key=lambda x: ipaddress.IPv4Address(x[0]))
+                        limit = 100
+                        for ip, _, delay in rc_final[:limit]:
+                            rc_table.add_row(str(ip), f"{delay}ms", "ALIVE")
+                    else:
+                        rc_table = Table(title=f"Recheck Results ({recheck_label})", border_style="green")
+                        rc_table.add_column("IP Address", style="cyan", justify="left")
+                        rc_table.add_column("Port", style="magenta", justify="center")
+                        rc_table.add_column("Delay", style="yellow", justify="center")
+                        rc_table.add_column("Status", style="green", justify="center")
+                        rc_final.sort(key=lambda x: (ipaddress.IPv4Address(x[0]), x[1]))
+                        limit = 100
+                        for ip, port, delay in rc_final[:limit]:
+                            rc_table.add_row(str(ip), str(port), f"{delay}ms", "VERIFIED")
+                    
+                    console.print(rc_table)
+                    if len(rc_final) > limit:
+                        console.print(f"[dim italic]... and {len(rc_final) - limit} more results.[/dim italic]")
+                    
+                    rc_save = Confirm.ask("\nDo you want to save the recheck results to a file?", default=True)
+                    if rc_save:
+                        rc_save_delay = Confirm.ask("Do you want to include delays in the output file?", default=False)
+                        os.makedirs("results", exist_ok=True)
+                        rc_prefix = "recheck_icmp" if recheck_mode == "icmp" else "recheck_handshake"
+                        rc_filename = f"{rc_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                        rc_filepath = os.path.join("results", os.path.basename(rc_filename))
+                        with open(rc_filepath, "w") as f:
+                            for res in rc_final:
+                                if recheck_mode == "icmp":
+                                    if rc_save_delay:
+                                        f.write(f"{res[0]}, {res[2]}ms\n")
+                                    else:
+                                        f.write(f"{res[0]}\n")
+                                else:
+                                    if rc_save_delay:
+                                        f.write(f"{res[0]}:{res[1]}, {res[2]}ms\n")
+                                    else:
+                                        f.write(f"{res[0]}:{res[1]}\n")
+                        console.print(f"[green]✔[/green] Recheck results saved to [bold white]{rc_filepath}[/bold white]")
 
 def fetch_ips_tool():
     console.print("\n[bold cyan]--- Fetch IPs by ASN or Country Code ---[/bold cyan]")
